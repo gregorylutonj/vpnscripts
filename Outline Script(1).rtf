@@ -1,0 +1,546 @@
+{\rtf1\ansi\ansicpg1254\deff0\nouicompat\deflang1055{\fonttbl{\f0\fnil\fcharset0 Calibri;}}
+{\colortbl ;\red0\green0\blue255;}
+{\*\generator Riched20 6.3.9600}\viewkind4\uc1 
+\pard\sa200\sl276\slmult1\f0\fs22\lang9 #!/bin/bash\par
+#\par
+# Copyright 2018 The Outline Authors\par
+#\par
+# Licensed under the Apache License, Version 2.0 (the "License");\par
+# you may not use this file except in compliance with the License.\par
+# You may obtain a copy of the License at\par
+#\par
+#      {{\field{\*\fldinst{HYPERLINK http://www.apache.org/licenses/LICENSE-2.0 }}{\fldrslt{http://www.apache.org/licenses/LICENSE-2.0\ul0\cf0}}}}\f0\fs22\par
+#\par
+# Unless required by applicable law or agreed to in writing, software\par
+# distributed under the License is distributed on an "AS IS" BASIS,\par
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\par
+# See the License for the specific language governing permissions and\par
+# limitations under the License.\par
+\par
+# Script to install the Outline Server docker container, a watchtower docker container\par
+# (to automatically update the server), and to create a new Outline user.\par
+\par
+# You may set the following environment variables, overriding their defaults:\par
+# SB_IMAGE: The Outline Server Docker image to install, e.g. quay.io/outline/shadowbox:nightly\par
+# SHADOWBOX_DIR: Directory for persistent Outline Server state.\par
+# ACCESS_CONFIG: The location of the access config text file.\par
+# SB_DEFAULT_SERVER_NAME: Default name for this server, e.g. "Outline server New York".\par
+#     This name will be used for the server until the admins updates the name\par
+#     via the REST API.\par
+# SENTRY_LOG_FILE: File for writing logs which may be reported to Sentry, in case\par
+#     of an install error. No PII should be written to this file. Intended to be set\par
+#     only by do_install_server.sh.\par
+# WATCHTOWER_REFRESH_SECONDS: refresh interval in seconds to check for updates,\par
+#     defaults to 3600.\par
+#\par
+# Deprecated:\par
+# SB_PUBLIC_IP: Use the --hostname flag instead\par
+# SB_API_PORT: Use the --api-port flag instead\par
+\par
+# Requires curl and docker to be installed\par
+\par
+set -euo pipefail\par
+\par
+function display_usage() \{\par
+  cat <<EOF\par
+Usage: install_server.sh [--hostname <hostname>] [--api-port <port>] [--keys-port <port>]\par
+  --hostname   The hostname to be used to access the management API and access keys\par
+  --api-port   The port number for the management API\par
+  --keys-port  The port number for the access keys\par
+EOF\par
+\}\par
+\par
+readonly SENTRY_LOG_FILE=$\{SENTRY_LOG_FILE:-\}\par
+\par
+# I/O conventions for this script:\par
+# - Ordinary status messages are printed to STDOUT\par
+# - STDERR is only used in the event of a fatal error\par
+# - Detailed logs are recorded to this FULL_LOG, which is preserved if an error occurred.\par
+# - The most recent error is stored in LAST_ERROR, which is never preserved.\par
+FULL_LOG="$(mktemp -t outline_logXXX)"\par
+LAST_ERROR="$(mktemp -t outline_last_errorXXX)"\par
+readonly FULL_LOG LAST_ERROR\par
+\par
+function log_command() \{\par
+  # Direct STDOUT and STDERR to FULL_LOG, and forward STDOUT.\par
+  # The most recent STDERR output will also be stored in LAST_ERROR.\par
+  "$@" > >(tee -a "$\{FULL_LOG\}") 2> >(tee -a "$\{FULL_LOG\}" > "$\{LAST_ERROR\}")\par
+\}\par
+\par
+function log_error() \{\par
+  local -r ERROR_TEXT="\\033[0;31m"  # red\par
+  local -r NO_COLOR="\\033[0m"\par
+  echo -e "$\{ERROR_TEXT\}$1$\{NO_COLOR\}"\par
+  echo "$1" >> "$\{FULL_LOG\}"\par
+\}\par
+\par
+# Pretty prints text to stdout, and also writes to sentry log file if set.\par
+function log_start_step() \{\par
+  log_for_sentry "$@"\par
+  local -r str="> $*"\par
+  local -ir lineLength=47\par
+  echo -n "$\{str\}"\par
+  local -ir numDots=$(( lineLength - $\{#str\} - 1 ))\par
+  if (( numDots > 0 )); then\par
+    echo -n " "\par
+    for _ in $(seq 1 "$\{numDots\}"); do echo -n .; done\par
+  fi\par
+  echo -n " "\par
+\}\par
+\par
+# Prints $1 as the step name and runs the remainder as a command.\par
+# STDOUT will be forwarded.  STDERR will be logged silently, and\par
+# revealed only in the event of a fatal error.\par
+function run_step() \{\par
+  local -r msg="$1"\par
+  log_start_step "$\{msg\}"\par
+  shift 1\par
+  if log_command "$@"; then\par
+    echo "OK"\par
+  else\par
+    # Propagates the error code\par
+    return\par
+  fi\par
+\}\par
+\par
+function confirm() \{\par
+  echo -n "> $1 [Y/n] "\par
+  local RESPONSE\par
+  read -r RESPONSE\par
+  RESPONSE=$(echo "$\{RESPONSE\}" | tr '[:upper:]' '[:lower:]') || return\par
+  [[ -z "$\{RESPONSE\}" || "$\{RESPONSE\}" == "y" || "$\{RESPONSE\}" == "yes" ]]\par
+\}\par
+\par
+function command_exists \{\par
+  command -v "$@" &> /dev/null\par
+\}\par
+\par
+function log_for_sentry() \{\par
+  if [[ -n "$\{SENTRY_LOG_FILE\}" ]]; then\par
+    echo "[$(date "+%Y-%m-%d@%H:%M:%S")] install_server.sh" "$@" >> "$\{SENTRY_LOG_FILE\}"\par
+  fi\par
+  echo "$@" >> "$\{FULL_LOG\}"\par
+\}\par
+\par
+# Check to see if docker is installed.\par
+function verify_docker_installed() \{\par
+  if command_exists docker; then\par
+    return 0\par
+  fi\par
+  log_error "NOT INSTALLED"\par
+  if ! confirm "Would you like to install Docker? This will run 'curl {{\field{\*\fldinst{HYPERLINK https://get.docker.com/ }}{\fldrslt{https://get.docker.com/\ul0\cf0}}}}\f0\fs22  | sh'."; then\par
+    exit 0\par
+  fi\par
+  if ! run_step "Installing Docker" install_docker; then\par
+    log_error "Docker installation failed, please visit {{\field{\*\fldinst{HYPERLINK https://docs.docker.com/install }}{\fldrslt{https://docs.docker.com/install\ul0\cf0}}}}\f0\fs22  for instructions."\par
+    exit 1\par
+  fi\par
+  log_start_step "Verifying Docker installation"\par
+  command_exists docker\par
+\}\par
+\par
+function verify_docker_running() \{\par
+  local STDERR_OUTPUT\par
+  STDERR_OUTPUT="$(docker info 2>&1 >/dev/null)"\par
+  local -ir RET=$?\par
+  if (( RET == 0 )); then\par
+    return 0\par
+  elif [[ "$\{STDERR_OUTPUT\}" == *"Is the docker daemon running"* ]]; then\par
+    start_docker\par
+    return\par
+  fi\par
+  return "$\{RET\}"\par
+\}\par
+\par
+function fetch() \{\par
+  curl --silent --show-error --fail "$@"\par
+\}\par
+\par
+function install_docker() \{\par
+  (fetch {{\field{\*\fldinst{HYPERLINK https://get.docker.com/ }}{\fldrslt{https://get.docker.com/\ul0\cf0}}}}\f0\fs22  | sh) >&2\par
+\}\par
+\par
+function start_docker() \{\par
+  systemctl enable --now docker.service >&2\par
+\}\par
+\par
+function docker_container_exists() \{\par
+  docker ps | grep --quiet "$1"\par
+\}\par
+\par
+function remove_shadowbox_container() \{\par
+  remove_docker_container shadowbox\par
+\}\par
+\par
+function remove_watchtower_container() \{\par
+  remove_docker_container watchtower\par
+\}\par
+\par
+function remove_docker_container() \{\par
+  docker rm -f "$1" >&2\par
+\}\par
+\par
+function handle_docker_container_conflict() \{\par
+  local -r CONTAINER_NAME="$1"\par
+  local -r EXIT_ON_NEGATIVE_USER_RESPONSE="$2"\par
+  local PROMPT="The container name \\"$\{CONTAINER_NAME\}\\" is already in use by another container. This may happen when running this script multiple times."\par
+  if [[ "$\{EXIT_ON_NEGATIVE_USER_RESPONSE\}" == 'true' ]]; then\par
+    PROMPT="$\{PROMPT\} We will attempt to remove the existing container and restart it. Would you like to proceed?"\par
+  else\par
+    PROMPT="$\{PROMPT\} Would you like to replace this container? If you answer no, we will proceed with the remainder of the installation."\par
+  fi\par
+  if ! confirm "$\{PROMPT\}"; then\par
+    if $\{EXIT_ON_NEGATIVE_USER_RESPONSE\}; then\par
+      exit 0\par
+    fi\par
+    return 0\par
+  fi\par
+  if run_step "Removing $\{CONTAINER_NAME\} container" "remove_$\{CONTAINER_NAME\}_container" ; then\par
+    log_start_step "Restarting $\{CONTAINER_NAME\}"\par
+    "start_$\{CONTAINER_NAME\}"\par
+    return $?\par
+  fi\par
+  return 1\par
+\}\par
+\par
+# Set trap which publishes error tag only if there is an error.\par
+function finish \{\par
+  local -ir EXIT_CODE=$?\par
+  if (( EXIT_CODE != 0 )); then\par
+    if [[ -s "$\{LAST_ERROR\}" ]]; then\par
+      log_error "\\nLast error: $(< "$\{LAST_ERROR\}")" >&2\par
+    fi\par
+    log_error "\\nSorry! Something went wrong. If you can't figure this out, please copy and paste all this output into the Outline Manager screen, and send it to us, to see if we can help you." >&2\par
+    log_error "Full log: $\{FULL_LOG\}" >&2\par
+  else\par
+    rm "$\{FULL_LOG\}"\par
+  fi\par
+  rm "$\{LAST_ERROR\}"\par
+\}\par
+\par
+function get_random_port \{\par
+  local -i num=0  # Init to an invalid value, to prevent "unbound variable" errors.\par
+  until (( 1024 <= num && num < 65536)); do\par
+    num=$(( RANDOM + (RANDOM % 2) * 32768 ));\par
+  done;\par
+  echo "$\{num\}";\par
+\}\par
+\par
+function create_persisted_state_dir() \{\par
+  readonly STATE_DIR="$\{SHADOWBOX_DIR\}/persisted-state"\par
+  mkdir -p "$\{STATE_DIR\}"\par
+  chmod ug+rwx,g+s,o-rwx "$\{STATE_DIR\}"\par
+\}\par
+\par
+# Generate a secret key for access to the Management API and store it in a tag.\par
+# 16 bytes = 128 bits of entropy should be plenty for this use.\par
+function safe_base64() \{\par
+  # Implements URL-safe base64 of stdin, stripping trailing = chars.\par
+  # Writes result to stdout.\par
+  # TODO: this gives the following errors on Mac:\par
+  #   base64: invalid option -- w\par
+  #   tr: illegal option -- -\par
+  local url_safe\par
+  url_safe="$(base64 -w 0 - | tr '/+' '_-')"\par
+  echo -n "$\{url_safe%%=*\}"  # Strip trailing = chars\par
+\}\par
+\par
+function generate_secret_key() \{\par
+  SB_API_PREFIX="$(head -c 16 /dev/urandom | safe_base64)"\par
+  readonly SB_API_PREFIX\par
+\}\par
+\par
+function generate_certificate() \{\par
+  # Generate self-signed cert and store it in the persistent state directory.\par
+  local -r CERTIFICATE_NAME="$\{STATE_DIR\}/shadowbox-selfsigned"\par
+  readonly SB_CERTIFICATE_FILE="$\{CERTIFICATE_NAME\}.crt"\par
+  readonly SB_PRIVATE_KEY_FILE="$\{CERTIFICATE_NAME\}.key"\par
+  declare -a openssl_req_flags=(\par
+    -x509 -nodes -days 36500 -newkey rsa:2048\par
+    -subj "/CN=$\{PUBLIC_HOSTNAME\}"\par
+    -keyout "$\{SB_PRIVATE_KEY_FILE\}" -out "$\{SB_CERTIFICATE_FILE\}"\par
+  )\par
+  openssl req "$\{openssl_req_flags[@]\}" >&2\par
+\}\par
+\par
+function generate_certificate_fingerprint() \{\par
+  # Add a tag with the SHA-256 fingerprint of the certificate.\par
+  # (Electron uses SHA-256 fingerprints: {{\field{\*\fldinst{HYPERLINK https://github.com/electron/electron/blob/9624bc140353b3771bd07c55371f6db65fd1b67e/atom/common/native_mate_converters/net_converter.cc#L60 }}{\fldrslt{https://github.com/electron/electron/blob/9624bc140353b3771bd07c55371f6db65fd1b67e/atom/common/native_mate_converters/net_converter.cc#L60\ul0\cf0}}}}\f0\fs22 )\par
+  # Example format: "SHA256 Fingerprint=BD:DB:C9:A4:39:5C:B3:4E:6E:CF:18:43:61:9F:07:A2:09:07:37:35:63:67"\par
+  local CERT_OPENSSL_FINGERPRINT\par
+  CERT_OPENSSL_FINGERPRINT="$(openssl x509 -in "$\{SB_CERTIFICATE_FILE\}" -noout -sha256 -fingerprint)" || return\par
+  # Example format: "BDDBC9A4395CB34E6ECF1843619F07A2090737356367"\par
+  local CERT_HEX_FINGERPRINT\par
+  CERT_HEX_FINGERPRINT="$(echo "$\{CERT_OPENSSL_FINGERPRINT#*=\}" | tr --delete :)" || return\par
+  output_config "certSha256:$\{CERT_HEX_FINGERPRINT\}"\par
+\}\par
+\par
+function join() \{\par
+  local IFS="$1"\par
+  shift\par
+  echo "$*"\par
+\}\par
+\par
+function write_config() \{\par
+  local -a config=()\par
+  if (( FLAGS_KEYS_PORT != 0 )); then\par
+    config+=("\\"portForNewAccessKeys\\": $\{FLAGS_KEYS_PORT\}")\par
+  fi\par
+  # printf is needed to escape the hostname.\par
+  config+=("$(printf '"hostname": "%q"' "$\{PUBLIC_HOSTNAME\}")")\par
+  echo "\{$(join , "$\{config[@]\}")\}" > "$\{STATE_DIR\}/shadowbox_server_config.json"\par
+\}\par
+\par
+function start_shadowbox() \{\par
+  # TODO(fortuna): Write API_PORT to config file,\par
+  # rather than pass in the environment.\par
+  local -ar docker_shadowbox_flags=(\par
+    --name shadowbox --restart always --net host\par
+    --label 'com.centurylinklabs.watchtower.enable=true'\par
+    -v "$\{STATE_DIR\}:$\{STATE_DIR\}"\par
+    -e "SB_STATE_DIR=$\{STATE_DIR\}"\par
+    -e "SB_API_PORT=$\{API_PORT\}"\par
+    -e "SB_API_PREFIX=$\{SB_API_PREFIX\}"\par
+    -e "SB_CERTIFICATE_FILE=$\{SB_CERTIFICATE_FILE\}"\par
+    -e "SB_PRIVATE_KEY_FILE=$\{SB_PRIVATE_KEY_FILE\}"\par
+    -e "SB_METRICS_URL=$\{SB_METRICS_URL:-\}"\par
+    -e "SB_DEFAULT_SERVER_NAME=$\{SB_DEFAULT_SERVER_NAME:-\}"\par
+  )\par
+  # By itself, local messes up the return code.\par
+  local STDERR_OUTPUT\par
+  STDERR_OUTPUT="$(docker run -d "$\{docker_shadowbox_flags[@]\}" "$\{SB_IMAGE\}" 2>&1 >/dev/null)" && return\par
+  readonly STDERR_OUTPUT\par
+  log_error "FAILED"\par
+  if docker_container_exists shadowbox; then\par
+    handle_docker_container_conflict shadowbox true\par
+    return\par
+  else\par
+    log_error "$\{STDERR_OUTPUT\}"\par
+    return 1\par
+  fi\par
+\}\par
+\par
+function start_watchtower() \{\par
+  # Start watchtower to automatically fetch docker image updates.\par
+  # Set watchtower to refresh every 30 seconds if a custom SB_IMAGE is used (for\par
+  # testing).  Otherwise refresh every hour.\par
+  local -ir WATCHTOWER_REFRESH_SECONDS="$\{WATCHTOWER_REFRESH_SECONDS:-3600\}"\par
+  local -ar docker_watchtower_flags=(--name watchtower --restart always \\\par
+      -v /var/run/docker.sock:/var/run/docker.sock)\par
+  # By itself, local messes up the return code.\par
+  local STDERR_OUTPUT\par
+  STDERR_OUTPUT="$(docker run -d "$\{docker_watchtower_flags[@]\}" containrrr/watchtower --cleanup --label-enable --tlsverify --interval "$\{WATCHTOWER_REFRESH_SECONDS\}" 2>&1 >/dev/null)" && return\par
+  readonly STDERR_OUTPUT\par
+  log_error "FAILED"\par
+  if docker_container_exists watchtower; then\par
+    handle_docker_container_conflict watchtower false\par
+    return\par
+  else\par
+    log_error "$\{STDERR_OUTPUT\}"\par
+    return 1\par
+  fi\par
+\}\par
+\par
+# Waits for the service to be up and healthy\par
+function wait_shadowbox() \{\par
+  # We use insecure connection because our threat model doesn't include localhost port\par
+  # interception and our certificate doesn't have localhost as a subject alternative name\par
+  until fetch --insecure "$\{LOCAL_API_URL\}/access-keys" >/dev/null; do sleep 1; done\par
+\}\par
+\par
+function create_first_user() \{\par
+  fetch --insecure --request POST "$\{LOCAL_API_URL\}/access-keys" >&2\par
+\}\par
+\par
+function output_config() \{\par
+  echo "$@" >> "$\{ACCESS_CONFIG\}"\par
+\}\par
+\par
+function add_api_url_to_config() \{\par
+  output_config "apiUrl:$\{PUBLIC_API_URL\}"\par
+\}\par
+\par
+function check_firewall() \{\par
+  # TODO(JonathanDCohen) This is incorrect if access keys are using more than one port.\par
+  local -i ACCESS_KEY_PORT\par
+  ACCESS_KEY_PORT=$(fetch --insecure "$\{LOCAL_API_URL\}/access-keys" |\par
+      docker exec -i shadowbox node -e '\par
+          const fs = require("fs");\par
+          const accessKeys = JSON.parse(fs.readFileSync(0, \{encoding: "utf-8"\}));\par
+          console.log(accessKeys["accessKeys"][0]["port"]);\par
+      ') || return\par
+  readonly ACCESS_KEY_PORT\par
+  if ! fetch --max-time 5 --cacert "$\{SB_CERTIFICATE_FILE\}" "$\{PUBLIC_API_URL\}/access-keys" >/dev/null; then\par
+     log_error "BLOCKED"\par
+     FIREWALL_STATUS="\\\par
+You won\rquote t be able to access it externally, despite your server being correctly\par
+set up, because there's a firewall (in this machine, your router or cloud\par
+provider) that is preventing incoming connections to ports $\{API_PORT\} and $\{ACCESS_KEY_PORT\}."\par
+  else\par
+    FIREWALL_STATUS="\\\par
+If you have connection problems, it may be that your router or cloud provider\par
+blocks inbound connections, even though your machine seems to allow them."\par
+  fi\par
+  FIREWALL_STATUS="\\\par
+$\{FIREWALL_STATUS\}\par
+Make sure to open the following ports on your firewall, router or cloud provider:\par
+- Management port $\{API_PORT\}, for TCP\par
+- Access key port $\{ACCESS_KEY_PORT\}, for TCP and UDP\par
+"\par
+\}\par
+\par
+function set_hostname() \{\par
+  # These are URLs that return the client's apparent IP address.\par
+  # We have more than one to try in case one starts failing\par
+  # (e.g. {{\field{\*\fldinst{HYPERLINK https://github.com/Jigsaw-Code/outline-server/issues/776 }}{\fldrslt{https://github.com/Jigsaw-Code/outline-server/issues/776\ul0\cf0}}}}\f0\fs22 ).\par
+  local -ar urls=(\par
+    '{{\field{\*\fldinst{HYPERLINK https://ipinfo.io/ip }}{\fldrslt{https://ipinfo.io/ip\ul0\cf0}}}}\f0\fs22 '\par
+    '{{\field{\*\fldinst{HYPERLINK https://domains.google.com/checkip }}{\fldrslt{https://domains.google.com/checkip\ul0\cf0}}}}\f0\fs22 '\par
+  )\par
+  for url in "$\{urls[@]\}"; do\par
+    PUBLIC_HOSTNAME="$(fetch --ipv4 "$\{url\}")" && return\par
+  done\par
+  echo "Failed to determine the server's IP address.  Try using --hostname <server IP>." >&2\par
+  return 1\par
+\}\par
+\par
+install_shadowbox() \{\par
+  # Make sure we don't leak readable files to other users.\par
+  umask 0007\par
+\par
+  run_step "Verifying that Docker is installed" verify_docker_installed\par
+  run_step "Verifying that Docker daemon is running" verify_docker_running\par
+\par
+  log_for_sentry "Creating Outline directory"\par
+  export SHADOWBOX_DIR="$\{SHADOWBOX_DIR:-/opt/outline\}"\par
+  mkdir -p "$\{SHADOWBOX_DIR\}"\par
+  chmod u+s,ug+rwx,o-rwx "$\{SHADOWBOX_DIR\}"\par
+\par
+  log_for_sentry "Setting API port"\par
+  API_PORT="$\{FLAGS_API_PORT\}"\par
+  if (( API_PORT == 0 )); then\par
+    API_PORT=$\{SB_API_PORT:-$(get_random_port)\}\par
+  fi\par
+  readonly API_PORT\par
+  readonly ACCESS_CONFIG="$\{ACCESS_CONFIG:-$\{SHADOWBOX_DIR\}/access.txt\}"\par
+  readonly SB_IMAGE="$\{SB_IMAGE:-quay.io/outline/shadowbox:stable\}"\par
+\par
+  PUBLIC_HOSTNAME="$\{FLAGS_HOSTNAME:-$\{SB_PUBLIC_IP:-\}\}"\par
+  if [[ -z "$\{PUBLIC_HOSTNAME\}" ]]; then\par
+    run_step "Setting PUBLIC_HOSTNAME to external IP" set_hostname\par
+  fi\par
+  readonly PUBLIC_HOSTNAME\par
+\par
+  # If $ACCESS_CONFIG is already populated, make a backup before clearing it.\par
+  log_for_sentry "Initializing ACCESS_CONFIG"\par
+  if [[ -s "$\{ACCESS_CONFIG\}" ]]; then\par
+    # Note we can't do "mv" here as do_install_server.sh may already be tailing\par
+    # this file.\par
+    cp "$\{ACCESS_CONFIG\}" "$\{ACCESS_CONFIG\}.bak" && true > "$\{ACCESS_CONFIG\}"\par
+  fi\par
+\par
+  # Make a directory for persistent state\par
+  run_step "Creating persistent state dir" create_persisted_state_dir\par
+  run_step "Generating secret key" generate_secret_key\par
+  run_step "Generating TLS certificate" generate_certificate\par
+  run_step "Generating SHA-256 certificate fingerprint" generate_certificate_fingerprint\par
+  run_step "Writing config" write_config\par
+\par
+  # TODO(dborkan): if the script fails after docker run, it will continue to fail\par
+  # as the names shadowbox and watchtower will already be in use.  Consider\par
+  # deleting the container in the case of failure (e.g. using a trap, or\par
+  # deleting existing containers on each run).\par
+  run_step "Starting Shadowbox" start_shadowbox\par
+  # TODO(fortuna): Don't wait for Shadowbox to run this.\par
+  run_step "Starting Watchtower" start_watchtower\par
+\par
+  readonly PUBLIC_API_URL="https://$\{PUBLIC_HOSTNAME\}:$\{API_PORT\}/$\{SB_API_PREFIX\}"\par
+  readonly LOCAL_API_URL="https://localhost:$\{API_PORT\}/$\{SB_API_PREFIX\}"\par
+  run_step "Waiting for Outline server to be healthy" wait_shadowbox\par
+  run_step "Creating first user" create_first_user\par
+  run_step "Adding API URL to config" add_api_url_to_config\par
+\par
+  FIREWALL_STATUS=""\par
+  run_step "Checking host firewall" check_firewall\par
+\par
+  # Echos the value of the specified field from ACCESS_CONFIG.\par
+  # e.g. if ACCESS_CONFIG contains the line "certSha256:1234",\par
+  # calling $(get_field_value certSha256) will echo 1234.\par
+  function get_field_value \{\par
+    grep "$1" "$\{ACCESS_CONFIG\}" | sed "s/$1://"\par
+  \}\par
+\par
+  # Output JSON.  This relies on apiUrl and certSha256 (hex characters) requiring\par
+  # no string escaping.  TODO: look for a way to generate JSON that doesn't\par
+  # require new dependencies.\par
+  cat <<END_OF_SERVER_OUTPUT\par
+CONGRATULATIONS! Your Outline server is up and running.\par
+To manage your Outline server, please copy the following line (including curly\par
+brackets) into Step 2 of the Outline Manager interface:\par
+$(echo -e "\\033[1;32m\{\\"apiUrl\\":\\"$(get_field_value apiUrl)\\",\\"certSha256\\":\\"$(get_field_value certSha256)\\"\}\\033[0m")\par
+$\{FIREWALL_STATUS\}\par
+END_OF_SERVER_OUTPUT\par
+\} # end of install_shadowbox\par
+\par
+function is_valid_port() \{\par
+  (( 0 < "$1" && "$1" <= 65535 ))\par
+\}\par
+\par
+function parse_flags() \{\par
+  local params\par
+  params="$(getopt --longoptions hostname:,api-port:,keys-port: -n "$0" -- "$0" "$@")"\par
+  eval set -- "$\{params\}"\par
+\par
+  while (( $# > 0 )); do\par
+    local flag="$1"\par
+    shift\par
+    case "$\{flag\}" in\par
+      --hostname)\par
+        FLAGS_HOSTNAME="$1"\par
+        shift\par
+        ;;\par
+      --api-port)\par
+        FLAGS_API_PORT=$1\par
+        shift\par
+        if ! is_valid_port "$\{FLAGS_API_PORT\}"; then\par
+          log_error "Invalid value for $\{flag\}: $\{FLAGS_API_PORT\}" >&2\par
+          exit 1\par
+        fi\par
+        ;;\par
+      --keys-port)\par
+        FLAGS_KEYS_PORT=$1\par
+        shift\par
+        if ! is_valid_port "$\{FLAGS_KEYS_PORT\}"; then\par
+          log_error "Invalid value for $\{flag\}: $\{FLAGS_KEYS_PORT\}" >&2\par
+          exit 1\par
+        fi\par
+        ;;\par
+      --)\par
+        break\par
+        ;;\par
+      *) # This should not happen\par
+        log_error "Unsupported flag $\{flag\}" >&2\par
+        display_usage >&2\par
+        exit 1\par
+        ;;\par
+    esac\par
+  done\par
+  if (( FLAGS_API_PORT != 0 && FLAGS_API_PORT == FLAGS_KEYS_PORT )); then\par
+    log_error "--api-port must be different from --keys-port" >&2\par
+    exit 1\par
+  fi\par
+  return 0\par
+\}\par
+\par
+function main() \{\par
+  trap finish EXIT\par
+  declare FLAGS_HOSTNAME=""\par
+  declare -i FLAGS_API_PORT=0\par
+  declare -i FLAGS_KEYS_PORT=0\par
+  parse_flags "$@"\par
+  install_shadowbox\par
+\}\par
+\par
+main "$@"\par
+}
+ 
